@@ -1,0 +1,14 @@
+# Folders
+images/
+objdetect_env/
+
+# Files
+*.pt
+*.pth
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+.python-version
+.env
