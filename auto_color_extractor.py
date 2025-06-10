@@ -3,6 +3,11 @@ import cv2
 from PIL import Image, ImageDraw
 from sklearn.cluster import KMeans
 from collections import Counter
+import logging
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class AutoColorExtractor:
@@ -41,7 +46,7 @@ class AutoColorExtractor:
                 "gradient_smoothness": gradient_smoothness,
             }
         except Exception as e:
-            print(f"⚠️ Analysis warning: {e}")
+            logger.error(f"Analysis warning: {e}")
             return {
                 "high_saturation_ratio": 0.5,
                 "very_dark_ratio": 0.1,
@@ -169,7 +174,7 @@ class AutoColorExtractor:
         """Combine multiple masks into one"""
         h, w = image_array.shape[:2]
         combined = np.zeros((h, w), dtype=bool)
-        
+
         for mask in masks:
             if mask.shape != (h, w):
                 mask_resized = cv2.resize(mask.astype(np.float32), (w, h))
@@ -177,14 +182,18 @@ class AutoColorExtractor:
             else:
                 mask_bool = mask > 0.5
             combined |= mask_bool
-        
+
         return combined
 
-    # NEW: Object-focused extraction method
     def extract_object_focused_colors(
-        self, image_path, object_detector=None, use_all_objects=False, debug=False
+        self,
+        image_path,
+        object_detector=None,
+        use_all_objects=False,
+        selected_object_indices=None,
+        debug=False,
     ):
-        """Extract colors focusing on the main detected object"""
+        """Extract colors focusing on selected objects"""
         try:
             if isinstance(image_path, str):
                 image = Image.open(image_path).convert("RGB")
@@ -193,35 +202,51 @@ class AutoColorExtractor:
 
             image_array = np.array(image)
 
-            # Try object detection first
             if object_detector and object_detector.is_available():
                 detection_results = object_detector.detect_objects(image)
 
                 if detection_results.get("detections"):
-                    # Combine all object masks
+                    # Determine which masks to use
+                    masks_to_use = []
+
+                    if use_all_objects:
+                        masks_to_use = [
+                            d.get("mask")
+                            for d in detection_results["detections"]
+                            if d.get("mask") is not None
+                        ]
+                    elif selected_object_indices:
+                        for idx in selected_object_indices:
+                            if 0 <= idx < len(detection_results["detections"]):
+                                mask = detection_results["detections"][idx].get("mask")
+                                if mask is not None:
+                                    masks_to_use.append(mask)
+                    else:
+                        main_mask = detection_results["detections"][0].get("mask")
+                        if main_mask is not None:
+                            masks_to_use = [main_mask]
+
+                    # Extract colors from selected masks
+                    if masks_to_use:
+                        if len(masks_to_use) == 1:
+                            object_colors = self._extract_from_object_mask(
+                                image_array, masks_to_use[0]
+                            )
+                        else:
+                            combined_mask = self._combine_masks(
+                                image_array, masks_to_use
+                            )
+                            object_colors = self._extract_from_object_mask(
+                                image_array, combined_mask
+                            )
+                    else:
+                        return self.extract_colors_adaptive(image_path, debug=debug)
+
+                    # Get main object info for display
                     main_object = detection_results["detections"][0]
                     object_name = main_object["object"]
                     confidence = main_object["confidence"]
-                    mask = main_object.get("mask")
-                    bbox = main_object["bbox"] 
-                    if use_all_objects:
-                        # Multi-object extraction logic
-                        all_masks = [d.get("mask") for d in detection_results["detections"] if d.get("mask") is not None]
-                        if all_masks:
-                            combined_mask = self._combine_masks(image_array, all_masks)
-                            object_colors = self._extract_from_object_mask(image_array, combined_mask)
-                        else:
-                            object_colors = self._extract_from_object_mask(image_array, mask)
-                    # Object detected - extract colors from object region
-                    else:
-                        # Extract colors from object region with expanded context
-                        object_colors = self._extract_from_object_mask(image_array, mask)
-
-                    if debug:
-                        print(
-                            f"🎯 Extracting colors from detected {object_name} (confidence: {confidence}%)"
-                        )
-
+                    bbox = main_object["bbox"]
 
                     # Add color names
                     for color in object_colors:
@@ -237,15 +262,13 @@ class AutoColorExtractor:
                         },
                         "image_analysis": {
                             "type": "object_focused",
-                            "strategy_used": "object_region",
+                            "strategy_used": "selected_objects"
+                            if selected_object_indices
+                            else ("all_objects" if use_all_objects else "main_object"),
                             "confidence": 0.9,
                         },
                     }
                 else:
-                    # No objects detected - fallback
-                    if debug:
-                        print("⚠️ No objects detected, falling back to whole image")
-
                     fallback_result = self.extract_colors_adaptive(
                         image_path, debug=debug
                     )
@@ -253,18 +276,16 @@ class AutoColorExtractor:
                     fallback_result["fallback_reason"] = "no_objects_detected"
                     return fallback_result
             else:
-                # Object detection not available - fallback
-                if debug:
-                    print(
-                        "⚠️ Object detection not available, falling back to whole image"
-                    )
-
                 fallback_result = self.extract_colors_adaptive(image_path, debug=debug)
                 fallback_result["extraction_method"] = "object_focused_fallback"
                 fallback_result["fallback_reason"] = "no_object_detector"
                 return fallback_result
 
         except Exception as e:
+            logger.error(f"DEBUG: Object extraction error: {str(e)}")
+            import traceback
+
+            traceback.print_exc()
             return {
                 "error": f"Object-focused extraction failed: {str(e)}",
                 "dominant_colors": [],
@@ -279,55 +300,58 @@ class AutoColorExtractor:
     def _extract_from_object_mask(self, image_array, mask):
         """Extract colors from segmentation mask (actual object pixels only)"""
         try:
-            # Convert mask to boolean and resize to image dimensions
             h, w = image_array.shape[:2]
-            
+
             # Resize mask to match image size if needed
             if mask.shape != (h, w):
                 mask_resized = cv2.resize(mask.astype(np.float32), (w, h))
-                mask_bool = mask_resized > 0.5  # Convert to boolean
+                mask_bool = mask_resized > 0.5
             else:
-                mask_bool = mask > 0.5  # Convert to boolean
-            
+                mask_bool = mask > 0.5
+
             # Extract object pixels
             object_pixels = image_array[mask_bool]
-            
+
             if len(object_pixels) < self.n_colors * 10:
-                # Fallback if mask too small
                 return self._extract_standard(image_array)
-            
+
             # Cluster only the actual object pixels
             n_colors = min(self.n_colors, len(object_pixels) // 10)
             if n_colors < 2:
                 n_colors = 2
-                
+
             kmeans = KMeans(n_clusters=n_colors, random_state=42)
             kmeans.fit(object_pixels)
-            
+
             colors = kmeans.cluster_centers_.astype(int)
             labels = kmeans.labels_
+
             return self._calculate_frequencies_with_labels(colors, labels)
-            
+
         except Exception as e:
-            print(f"⚠️ Mask extraction failed: {e}, falling back to standard")
+            logger.error(f"Mask extraction failed: {e}, falling back to standard")
             return self._extract_standard(image_array)
 
-    # UPDATED: Build color scheme with object focus option
     def build_color_scheme(
         self,
         image_path,
         object_detector=None,
         extract_from_object=False,
         use_all_objects=False,
+        selected_object_indices=None,
         width=400,
-        height=100,
+        height=200,
     ):
         """Build a proportional color scheme visualization"""
         try:
             # Choose extraction method
             if extract_from_object:
                 results = self.extract_object_focused_colors(
-                    image_path, object_detector, use_all_objects, debug=False
+                    image_path,
+                    object_detector,
+                    use_all_objects,
+                    selected_object_indices,
+                    debug=False,
                 )
             else:
                 results = self.extract_colors_adaptive(image_path, debug=False)
@@ -372,16 +396,24 @@ class AutoColorExtractor:
             }
             return error_image, error_results
 
-    # UPDATED: Get palette data with object focus option
     def get_color_palette_data(
-        self, image_path, object_detector=None, extract_from_object=False, use_all_objects=False
+        self,
+        image_path,
+        object_detector=None,
+        extract_from_object=False,
+        use_all_objects=False,
+        selected_object_indices=None,
     ):
         """Get color palette data formatted for UI display"""
         try:
             # Choose extraction method
             if extract_from_object:
                 results = self.extract_object_focused_colors(
-                    image_path, object_detector, use_all_objects, debug=False
+                    image_path,
+                    object_detector,
+                    use_all_objects,
+                    selected_object_indices,
+                    debug=False,
                 )
             else:
                 results = self.extract_colors_adaptive(image_path, debug=False)
@@ -412,8 +444,6 @@ class AutoColorExtractor:
 
         except Exception as e:
             return {"error": f"Palette generation failed: {str(e)}"}
-
-    # ... rest of your existing methods (keeping them the same) ...
 
     def _extract_with_strategy(self, image_array, strategy, params):
         """Apply the chosen extraction strategy"""
@@ -597,12 +627,12 @@ class AutoColorExtractor:
 
     def _print_analysis(self, metrics, classification):
         """Print detailed analysis for debugging"""
-        print("=== AUTOMATIC IMAGE ANALYSIS ===")
-        print(f"Image Type: {classification['image_type']}")
-        print(f"Strategy: {classification['strategy']}")
-        print(f"Confidence: {classification['confidence']:.1%}")
-        print(f"\nKey Metrics:")
-        print(f"  High Saturation Ratio: {metrics['high_saturation_ratio']:.1%}")
-        print(f"  Dark Areas Ratio: {metrics['very_dark_ratio']:.1%}")
-        print(f"  Gradient Smoothness: {metrics['gradient_smoothness']:.3f}")
-        print("=" * 35)
+        logger.info("=== AUTOMATIC IMAGE ANALYSIS ===")
+        logger.info(f"Image Type: {classification['image_type']}")
+        logger.info(f"Strategy: {classification['strategy']}")
+        logger.info(f"Confidence: {classification['confidence']:.1%}")
+        logger.info(f"\nKey Metrics:")
+        logger.info(f"  High Saturation Ratio: {metrics['high_saturation_ratio']:.1%}")
+        logger.info(f"  Dark Areas Ratio: {metrics['very_dark_ratio']:.1%}")
+        logger.info(f"  Gradient Smoothness: {metrics['gradient_smoothness']:.3f}")
+        logger.info("=" * 35)
